@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -170,50 +169,7 @@ func TestParseSystemdToCgroupName(t *testing.T) {
 	}
 }
 
-func TestCpuSharesToCpuWeight(t *testing.T) {
-	testCases := []struct {
-		cpuShares         uint64
-		expectedCpuWeight uint64
-	}{
-		{
-			cpuShares:         2,
-			expectedCpuWeight: 1,
-		},
-		{
-			cpuShares:         3,
-			expectedCpuWeight: 1,
-		},
-		{
-			cpuShares:         4,
-			expectedCpuWeight: 1,
-		},
-		{
-			cpuShares:         28,
-			expectedCpuWeight: 1,
-		},
-		{
-			cpuShares:         29,
-			expectedCpuWeight: 2,
-		},
-		{
-			cpuShares:         245,
-			expectedCpuWeight: 10,
-		},
-		{
-			cpuShares:         262144,
-			expectedCpuWeight: 10000,
-		},
-	}
-
-	for _, testCase := range testCases {
-		if actual := CpuSharesToCpuWeight(testCase.cpuShares); actual != testCase.expectedCpuWeight {
-			t.Errorf("cpuShares: %v, expectedCpuWeight: %v, actualCpuWeight: %v",
-				testCase.cpuShares, testCase.expectedCpuWeight, actual)
-		}
-	}
-}
-
-func TestCpuWeightToCpuShares(t *testing.T) {
+func TestCpuWeightToCPUShares(t *testing.T) {
 	testCases := []struct {
 		cpuWeight         uint64
 		expectedCpuShares uint64
@@ -245,7 +201,7 @@ func TestCpuWeightToCpuShares(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		if actual := CpuWeightToCpuShares(testCase.cpuWeight); actual != testCase.expectedCpuShares {
+		if actual := cpuWeightToCPUShares(testCase.cpuWeight); actual != testCase.expectedCpuShares {
 			t.Errorf("cpuWeight: %v, expectedCpuShares: %v, actualCpuShares: %v",
 				testCase.cpuWeight, testCase.expectedCpuShares, actual)
 		}

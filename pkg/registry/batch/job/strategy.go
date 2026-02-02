@@ -45,7 +45,7 @@ import (
 	"k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 )
 
 // jobStrategy implements verification logic for Replication Controllers.
@@ -98,9 +98,6 @@ func (jobStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 
 	job.Generation = 1
 
-	if !utilfeature.DefaultFeatureGate.Enabled(features.JobPodFailurePolicy) {
-		job.Spec.PodFailurePolicy = nil
-	}
 	if !utilfeature.DefaultFeatureGate.Enabled(features.JobManagedBy) {
 		job.Spec.ManagedBy = nil
 	}
@@ -137,9 +134,6 @@ func (jobStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object
 	oldJob := old.(*batch.Job)
 	newJob.Status = oldJob.Status
 
-	if !utilfeature.DefaultFeatureGate.Enabled(features.JobPodFailurePolicy) && oldJob.Spec.PodFailurePolicy == nil {
-		newJob.Spec.PodFailurePolicy = nil
-	}
 	if !utilfeature.DefaultFeatureGate.Enabled(features.JobSuccessPolicy) && oldJob.Spec.SuccessPolicy == nil {
 		newJob.Spec.SuccessPolicy = nil
 	}
@@ -187,19 +181,22 @@ func validationOptionsForJob(newJob, oldJob *batch.Job) batchvalidation.JobValid
 		oldPodTemplate = &oldJob.Spec.Template
 	}
 	opts := batchvalidation.JobValidationOptions{
-		PodValidationOptions:    pod.GetValidationOptionsFromPodTemplate(newPodTemplate, oldPodTemplate),
-		AllowElasticIndexedJobs: utilfeature.DefaultFeatureGate.Enabled(features.ElasticIndexedJob),
-		RequirePrefixedLabels:   true,
+		PodValidationOptions:  pod.GetValidationOptionsFromPodTemplate(newPodTemplate, oldPodTemplate),
+		RequirePrefixedLabels: true,
 	}
 	if oldJob != nil {
 		opts.AllowInvalidLabelValueInSelector = opts.AllowInvalidLabelValueInSelector || metav1validation.LabelSelectorHasInvalidLabelValue(oldJob.Spec.Selector)
-
 		// Updating node affinity, node selector and tolerations is allowed
 		// only for suspended jobs that never started before.
 		suspended := oldJob.Spec.Suspend != nil && *oldJob.Spec.Suspend
 		notStarted := oldJob.Status.StartTime == nil
 		opts.AllowMutableSchedulingDirectives = suspended && notStarted
-
+		if utilfeature.DefaultFeatureGate.Enabled(features.MutablePodResourcesForSuspendedJobs) {
+			opts.AllowMutablePodResources = suspended && batchvalidation.IsConditionTrue(oldJob.Status.Conditions, batch.JobSuspended) && oldJob.Status.Active == 0
+		}
+		if utilfeature.DefaultFeatureGate.Enabled(features.MutableSchedulingDirectivesForSuspendedJobs) {
+			opts.AllowMutableSchedulingDirectives = suspended && batchvalidation.IsConditionTrue(oldJob.Status.Conditions, batch.JobSuspended) && oldJob.Status.Active == 0
+		}
 		// Validation should not fail jobs if they don't have the new labels.
 		// This can be removed once we have high confidence that both labels exist (1.30 at least)
 		_, hadJobName := oldJob.Spec.Template.Labels[batch.JobNameLabel]
@@ -377,12 +374,21 @@ func getStatusValidationOptions(newJob, oldJob *batch.Job) batchvalidation.JobSt
 		isJobCompleteChanged := batchvalidation.IsJobComplete(oldJob) != batchvalidation.IsJobComplete(newJob)
 		isJobFailedChanged := batchvalidation.IsJobFailed(oldJob) != batchvalidation.IsJobFailed(newJob)
 		isJobFailureTargetChanged := batchvalidation.IsConditionTrue(oldJob.Status.Conditions, batch.JobFailureTarget) != batchvalidation.IsConditionTrue(newJob.Status.Conditions, batch.JobFailureTarget)
+		isJobSuccessCriteriaMetChanged := batchvalidation.IsConditionTrue(oldJob.Status.Conditions, batch.JobSuccessCriteriaMet) != batchvalidation.IsConditionTrue(newJob.Status.Conditions, batch.JobSuccessCriteriaMet)
 		isCompletedIndexesChanged := oldJob.Status.CompletedIndexes != newJob.Status.CompletedIndexes
 		isFailedIndexesChanged := !ptr.Equal(oldJob.Status.FailedIndexes, newJob.Status.FailedIndexes)
 		isActiveChanged := oldJob.Status.Active != newJob.Status.Active
 		isStartTimeChanged := !ptr.Equal(oldJob.Status.StartTime, newJob.Status.StartTime)
 		isCompletionTimeChanged := !ptr.Equal(oldJob.Status.CompletionTime, newJob.Status.CompletionTime)
 		isUncountedTerminatedPodsChanged := !apiequality.Semantic.DeepEqual(oldJob.Status.UncountedTerminatedPods, newJob.Status.UncountedTerminatedPods)
+		isReadyChanged := !ptr.Equal(oldJob.Status.Ready, newJob.Status.Ready)
+		isTerminatingChanged := !ptr.Equal(oldJob.Status.Terminating, newJob.Status.Terminating)
+		isSuspendedWithZeroCompletions := ptr.Equal(newJob.Spec.Suspend, ptr.To(true)) && ptr.Equal(newJob.Spec.Completions, ptr.To[int32](0))
+		// Detect job resume via condition changes (JobSuspended: True -> False)
+		// This handles the case where the controller updates status after the user has already
+		// changed spec.suspend=false, which is the scenario from https://github.com/kubernetes/kubernetes/issues/134521
+		isJobResuming := batchvalidation.IsConditionTrue(oldJob.Status.Conditions, batch.JobSuspended) &&
+			batchvalidation.IsConditionFalse(newJob.Status.Conditions, batch.JobSuspended)
 
 		return batchvalidation.JobStatusValidationOptions{
 			// We allow to decrease the counter for succeeded pods for jobs which
@@ -395,19 +401,31 @@ func getStatusValidationOptions(newJob, oldJob *batch.Job) batchvalidation.JobSt
 			RejectCompletedIndexesForNonIndexedJob:       isCompletedIndexesChanged,
 			RejectFailedIndexesForNoBackoffLimitPerIndex: isFailedIndexesChanged,
 			RejectFailedIndexesOverlappingCompleted:      isFailedIndexesChanged || isCompletedIndexesChanged,
+			RejectFailedJobWithoutFailureTarget:          isJobFailedChanged || isFailedIndexesChanged,
+			RejectCompleteJobWithoutSuccessCriteriaMet:   isJobCompleteChanged || isJobSuccessCriteriaMetChanged,
 			RejectFinishedJobWithActivePods:              isJobFinishedChanged || isActiveChanged,
-			RejectFinishedJobWithoutStartTime:            isJobFinishedChanged || isStartTimeChanged,
+			RejectFinishedJobWithoutStartTime:            (isJobFinishedChanged || isStartTimeChanged) && !isSuspendedWithZeroCompletions,
 			RejectFinishedJobWithUncountedTerminatedPods: isJobFinishedChanged || isUncountedTerminatedPodsChanged,
-			RejectStartTimeUpdateForUnsuspendedJob:       isStartTimeChanged,
+			RejectStartTimeUpdateForUnsuspendedJob:       isStartTimeChanged && !isJobResuming,
 			RejectCompletionTimeBeforeStartTime:          isStartTimeChanged || isCompletionTimeChanged,
 			RejectMutatingCompletionTime:                 true,
 			RejectNotCompleteJobWithCompletionTime:       isJobCompleteChanged || isCompletionTimeChanged,
 			RejectCompleteJobWithoutCompletionTime:       isJobCompleteChanged || isCompletionTimeChanged,
 			RejectCompleteJobWithFailedCondition:         isJobCompleteChanged || isJobFailedChanged,
 			RejectCompleteJobWithFailureTargetCondition:  isJobCompleteChanged || isJobFailureTargetChanged,
+			AllowForSuccessCriteriaMetInExtendedScope:    true,
+			RejectMoreReadyThanActivePods:                isReadyChanged || isActiveChanged,
+			RejectFinishedJobWithTerminatingPods:         isJobFinishedChanged || isTerminatingChanged,
 		}
 	}
-	return batchvalidation.JobStatusValidationOptions{}
+	if utilfeature.DefaultFeatureGate.Enabled(features.JobPodReplacementPolicy) {
+		return batchvalidation.JobStatusValidationOptions{
+			AllowForSuccessCriteriaMetInExtendedScope: true,
+		}
+	}
+	return batchvalidation.JobStatusValidationOptions{
+		AllowForSuccessCriteriaMetInExtendedScope: batchvalidation.IsConditionTrue(oldJob.Status.Conditions, batch.JobSuccessCriteriaMet),
+	}
 }
 
 // WarningsOnUpdate returns warnings for the given update.

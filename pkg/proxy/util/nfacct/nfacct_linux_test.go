@@ -1,5 +1,4 @@
-//go:build linux
-// +build linux
+//go:build linux && !s390x
 
 /*
 Copyright 2024 The Kubernetes Authors.
@@ -16,6 +15,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+// Skip s390x: This test is disabled on s390x due to failures caused by little-endian specific input data.
+// See issue: https://github.com/kubernetes/kubernetes/issues/130343
 
 package nfacct
 
@@ -158,7 +160,7 @@ func TestRunner_Add(t *testing.T) {
 			}
 
 			// validate number of requests
-			assert.Equal(t, tc.netlinkCalls, len(tc.handler.requests))
+			assert.Len(t, tc.handler.requests, tc.netlinkCalls)
 
 			if tc.netlinkCalls > 0 {
 				// validate request
@@ -166,7 +168,7 @@ func TestRunner_Add(t *testing.T) {
 				assert.Equal(t, uint16(unix.NLM_F_REQUEST|unix.NLM_F_CREATE|unix.NLM_F_ACK), tc.handler.requests[0].flags)
 
 				// validate attribute(NFACCT_NAME)
-				assert.Equal(t, 1, len(tc.handler.requests[0].data))
+				assert.Len(t, tc.handler.requests[0].data, 1)
 				assert.Equal(t,
 					tc.handler.requests[0].data[0].Serialize(),
 					nl.NewRtAttr(attrName, nl.ZeroTerminated(tc.counterName)).Serialize(),
@@ -343,14 +345,14 @@ func TestRunner_Get(t *testing.T) {
 			counter, err := rnr.Get(tc.counterName)
 
 			// validate number of requests
-			assert.Equal(t, tc.netlinkCalls, len(tc.handler.requests))
+			assert.Len(t, tc.handler.requests, tc.netlinkCalls)
 			if tc.netlinkCalls > 0 {
 				// validate request
 				assert.Equal(t, cmdGet, tc.handler.requests[0].cmd)
 				assert.Equal(t, uint16(unix.NLM_F_REQUEST|unix.NLM_F_ACK), tc.handler.requests[0].flags)
 
 				// validate attribute(NFACCT_NAME)
-				assert.Equal(t, 1, len(tc.handler.requests[0].data))
+				assert.Len(t, tc.handler.requests[0].data, 1)
 				assert.Equal(t,
 					tc.handler.requests[0].data[0].Serialize(),
 					nl.NewRtAttr(attrName, nl.ZeroTerminated(tc.counterName)).Serialize())
@@ -417,7 +419,7 @@ func TestRunner_Ensure(t *testing.T) {
 			assert.NoError(t, err)
 
 			// validate number of netlink requests
-			assert.Equal(t, tc.netlinkCalls, len(tc.handler.requests))
+			assert.Len(t, tc.handler.requests, tc.netlinkCalls)
 		})
 	}
 
@@ -481,12 +483,12 @@ func TestRunner_List(t *testing.T) {
 	counters, err := rnr.List()
 
 	// validate request(NFNL_MSG_ACCT_GET)
-	assert.Equal(t, 1, len(hndlr.requests))
+	assert.Len(t, hndlr.requests, 1)
 	assert.Equal(t, cmdGet, hndlr.requests[0].cmd)
 	assert.Equal(t, uint16(unix.NLM_F_REQUEST|unix.NLM_F_DUMP), hndlr.requests[0].flags)
 
 	// validate attributes
-	assert.Equal(t, 0, len(hndlr.requests[0].data))
+	assert.Empty(t, hndlr.requests[0].data)
 
 	// validate response
 	assert.NoError(t, err)

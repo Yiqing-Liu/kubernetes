@@ -22,14 +22,17 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	utilversion "k8s.io/apimachinery/pkg/util/version"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	podtest "k8s.io/kubernetes/pkg/api/pod/testing"
 	apitesting "k8s.io/kubernetes/pkg/api/testing"
 	"k8s.io/kubernetes/pkg/apis/batch"
 	_ "k8s.io/kubernetes/pkg/apis/batch/install"
@@ -87,7 +90,6 @@ func TestJobStrategy_PrepareForUpdate(t *testing.T) {
 	}
 
 	cases := map[string]struct {
-		enableJobPodFailurePolicy     bool
 		enableJobBackoffLimitPerIndex bool
 		enableJobPodReplacementPolicy bool
 		enableJobSuccessPolicy        bool
@@ -263,8 +265,7 @@ func TestJobStrategy_PrepareForUpdate(t *testing.T) {
 				},
 			},
 		},
-		"update job with a new field; updated when JobPodFailurePolicy enabled": {
-			enableJobPodFailurePolicy: true,
+		"update job with a new field; updated": {
 			job: batch.Job{
 				ObjectMeta: getValidObjectMeta(0),
 				Spec: batch.JobSpec{
@@ -344,62 +345,7 @@ func TestJobStrategy_PrepareForUpdate(t *testing.T) {
 				},
 			},
 		},
-		"update job with a new field; not updated when JobPodFailurePolicy disabled": {
-			enableJobPodFailurePolicy: false,
-			job: batch.Job{
-				ObjectMeta: getValidObjectMeta(0),
-				Spec: batch.JobSpec{
-					Selector:         validSelector,
-					Template:         validPodTemplateSpec,
-					PodFailurePolicy: nil,
-				},
-			},
-			updatedJob: batch.Job{
-				ObjectMeta: getValidObjectMeta(0),
-				Spec: batch.JobSpec{
-					Selector:         validSelector,
-					Template:         validPodTemplateSpec,
-					PodFailurePolicy: updatedPodFailurePolicy,
-				},
-			},
-			wantJob: batch.Job{
-				ObjectMeta: getValidObjectMeta(0),
-				Spec: batch.JobSpec{
-					Selector:         validSelector,
-					Template:         validPodTemplateSpec,
-					PodFailurePolicy: nil,
-				},
-			},
-		},
-		"update pre-existing field; updated when JobPodFailurePolicy enabled": {
-			enableJobPodFailurePolicy: true,
-			job: batch.Job{
-				ObjectMeta: getValidObjectMeta(0),
-				Spec: batch.JobSpec{
-					Selector:         validSelector,
-					Template:         validPodTemplateSpec,
-					PodFailurePolicy: podFailurePolicy,
-				},
-			},
-			updatedJob: batch.Job{
-				ObjectMeta: getValidObjectMeta(0),
-				Spec: batch.JobSpec{
-					Selector:         validSelector,
-					Template:         validPodTemplateSpec,
-					PodFailurePolicy: updatedPodFailurePolicy,
-				},
-			},
-			wantJob: batch.Job{
-				ObjectMeta: getValidObjectMeta(1),
-				Spec: batch.JobSpec{
-					Selector:         validSelector,
-					Template:         validPodTemplateSpec,
-					PodFailurePolicy: updatedPodFailurePolicy,
-				},
-			},
-		},
-		"update pre-existing field; updated when JobPodFailurePolicy disabled": {
-			enableJobPodFailurePolicy: false,
+		"update pre-existing field; updated": {
 			job: batch.Job{
 				ObjectMeta: getValidObjectMeta(0),
 				Spec: batch.JobSpec{
@@ -568,10 +514,18 @@ func TestJobStrategy_PrepareForUpdate(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobPodFailurePolicy, tc.enableJobPodFailurePolicy)
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobBackoffLimitPerIndex, tc.enableJobBackoffLimitPerIndex)
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobPodReplacementPolicy, tc.enableJobPodReplacementPolicy)
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobSuccessPolicy, tc.enableJobSuccessPolicy)
+			if !tc.enableJobBackoffLimitPerIndex || !tc.enableJobSuccessPolicy {
+				// TODO: this will be removed in 1.36
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.32"))
+			} else if !tc.enableJobPodReplacementPolicy {
+				// TODO: this will be removed in 1.37.
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.33"))
+			}
+			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+				features.JobBackoffLimitPerIndex: tc.enableJobBackoffLimitPerIndex,
+				features.JobPodReplacementPolicy: tc.enableJobPodReplacementPolicy,
+				features.JobSuccessPolicy:        tc.enableJobSuccessPolicy,
+			})
 			ctx := genericapirequest.NewDefaultContext()
 
 			Strategy.PrepareForUpdate(ctx, &tc.updatedJob, &tc.job)
@@ -612,7 +566,6 @@ func TestJobStrategy_PrepareForCreate(t *testing.T) {
 	}
 
 	cases := map[string]struct {
-		enableJobPodFailurePolicy     bool
 		enableJobBackoffLimitPerIndex bool
 		enableJobPodReplacementPolicy bool
 		enableJobManageBy             bool
@@ -726,8 +679,7 @@ func TestJobStrategy_PrepareForCreate(t *testing.T) {
 				},
 			},
 		},
-		"create job with a new field; JobPodFailurePolicy enabled": {
-			enableJobPodFailurePolicy: true,
+		"create job with a new field": {
 			job: batch.Job{
 				ObjectMeta: getValidObjectMeta(0),
 				Spec: batch.JobSpec{
@@ -789,27 +741,6 @@ func TestJobStrategy_PrepareForCreate(t *testing.T) {
 				},
 			},
 		},
-		"create job with a new field; JobPodFailurePolicy disabled": {
-			enableJobPodFailurePolicy: false,
-			job: batch.Job{
-				ObjectMeta: getValidObjectMeta(0),
-				Spec: batch.JobSpec{
-					Selector:         validSelector,
-					ManualSelector:   ptr.To(false),
-					Template:         validPodTemplateSpec,
-					PodFailurePolicy: podFailurePolicy,
-				},
-			},
-			wantJob: batch.Job{
-				ObjectMeta: getValidObjectMeta(1),
-				Spec: batch.JobSpec{
-					Selector:         validSelector,
-					ManualSelector:   ptr.To(false),
-					Template:         expectedPodTemplateSpec,
-					PodFailurePolicy: nil,
-				},
-			},
-		},
 		"job does not allow setting status on create": {
 			job: batch.Job{
 				ObjectMeta: getValidObjectMeta(0),
@@ -831,9 +762,8 @@ func TestJobStrategy_PrepareForCreate(t *testing.T) {
 				},
 			},
 		},
-		"create job with pod failure policy using FailIndex action; JobPodFailurePolicy enabled, JobBackoffLimitPerIndex disabled": {
+		"create job with pod failure policy using FailIndex action; JobBackoffLimitPerIndex disabled": {
 			enableJobBackoffLimitPerIndex: false,
-			enableJobPodFailurePolicy:     true,
 			job: batch.Job{
 				ObjectMeta: getValidObjectMeta(0),
 				Spec: batch.JobSpec{
@@ -866,9 +796,8 @@ func TestJobStrategy_PrepareForCreate(t *testing.T) {
 				},
 			},
 		},
-		"create job with multiple pod failure policy rules, some using FailIndex action; JobPodFailurePolicy enabled, JobBackoffLimitPerIndex disabled": {
+		"create job with multiple pod failure policy rules, some using FailIndex action; JobBackoffLimitPerIndex disabled": {
 			enableJobBackoffLimitPerIndex: false,
-			enableJobPodFailurePolicy:     true,
 			job: batch.Job{
 				ObjectMeta: getValidObjectMeta(0),
 				Spec: batch.JobSpec{
@@ -975,11 +904,16 @@ func TestJobStrategy_PrepareForCreate(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobPodFailurePolicy, tc.enableJobPodFailurePolicy)
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobBackoffLimitPerIndex, tc.enableJobBackoffLimitPerIndex)
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobPodReplacementPolicy, tc.enableJobPodReplacementPolicy)
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobManagedBy, tc.enableJobManageBy)
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobSuccessPolicy, tc.enableJobSuccessPolicy)
+			if !tc.enableJobBackoffLimitPerIndex || !tc.enableJobSuccessPolicy {
+				// TODO: this will be removed in 1.36
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.32"))
+			}
+			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+				features.JobBackoffLimitPerIndex: tc.enableJobBackoffLimitPerIndex,
+				features.JobPodReplacementPolicy: tc.enableJobPodReplacementPolicy,
+				features.JobManagedBy:            tc.enableJobManageBy,
+				features.JobSuccessPolicy:        tc.enableJobSuccessPolicy,
+			})
 			ctx := genericapirequest.NewDefaultContext()
 
 			Strategy.PrepareForCreate(ctx, &tc.job)
@@ -1020,17 +954,12 @@ func TestJobStrategy_ValidateUpdate(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: validSelector.MatchLabels,
 		},
-		Spec: api.PodSpec{
-			RestartPolicy: api.RestartPolicyOnFailure,
-			DNSPolicy:     api.DNSClusterFirst,
-			Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-		},
+		Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure)),
 	}
 	validPodTemplateSpecNever := *validPodTemplateSpec.DeepCopy()
 	validPodTemplateSpecNever.Spec.RestartPolicy = api.RestartPolicyNever
 	now := metav1.Now()
 	cases := map[string]struct {
-		enableJobPodFailurePolicy     bool
 		enableJobBackoffLimitPerIndex bool
 		job                           *batch.Job
 		update                        func(*batch.Job)
@@ -1076,50 +1005,7 @@ func TestJobStrategy_ValidateUpdate(t *testing.T) {
 				{Type: field.ErrorTypeInvalid, Field: "spec.completions"},
 			},
 		},
-		"preserving tracking annotation": {
-			job: &batch.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:            "myjob",
-					Namespace:       metav1.NamespaceDefault,
-					ResourceVersion: "0",
-					Annotations: map[string]string{
-						batch.JobTrackingFinalizer: "",
-					},
-				},
-				Spec: batch.JobSpec{
-					Selector:       validSelector,
-					Template:       validPodTemplateSpec,
-					ManualSelector: ptr.To(true),
-					Parallelism:    ptr.To[int32](1),
-				},
-			},
-			update: func(job *batch.Job) {
-				job.Annotations["foo"] = "bar"
-			},
-		},
-		"deleting user annotation": {
-			job: &batch.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:            "myjob",
-					Namespace:       metav1.NamespaceDefault,
-					ResourceVersion: "0",
-					Annotations: map[string]string{
-						batch.JobTrackingFinalizer: "",
-						"foo":                      "bar",
-					},
-				},
-				Spec: batch.JobSpec{
-					Selector:       validSelector,
-					Template:       validPodTemplateSpec,
-					ManualSelector: ptr.To(true),
-					Parallelism:    ptr.To[int32](1),
-				},
-			},
-			update: func(job *batch.Job) {
-				delete(job.Annotations, "foo")
-			},
-		},
-		"updating node selector for unsuspended job disallowed": {
+		"updating node selector for unsuspended job disallowed with MutablePodResourcesForSuspendedJobs disabled": {
 			job: &batch.Job{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:            "myjob",
@@ -1141,7 +1027,7 @@ func TestJobStrategy_ValidateUpdate(t *testing.T) {
 				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
 			},
 		},
-		"updating node selector for suspended but previously started job disallowed": {
+		"updating node selector for suspended but previously started job disallowed with MutablePodResourcesForSuspendedJobs disabled": {
 			job: &batch.Job{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:            "myjob",
@@ -1167,7 +1053,7 @@ func TestJobStrategy_ValidateUpdate(t *testing.T) {
 				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
 			},
 		},
-		"updating node selector for suspended and not previously started job allowed": {
+		"updating node selector for suspended and not previously started job allowed with MutablePodResourcesForSuspendedJobs disabled": {
 			job: &batch.Job{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:            "myjob",
@@ -1226,11 +1112,7 @@ func TestJobStrategy_ValidateUpdate(t *testing.T) {
 						ObjectMeta: metav1.ObjectMeta{
 							Labels: map[string]string{batch.LegacyJobNameLabel: "myjob", batch.LegacyControllerUidLabel: "test"},
 						},
-						Spec: api.PodSpec{
-							RestartPolicy: api.RestartPolicyOnFailure,
-							DNSPolicy:     api.DNSClusterFirst,
-							Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-						},
+						Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure)),
 					},
 				},
 			},
@@ -1256,11 +1138,7 @@ func TestJobStrategy_ValidateUpdate(t *testing.T) {
 						ObjectMeta: metav1.ObjectMeta{
 							Labels: map[string]string{batch.LegacyJobNameLabel: "myjob", batch.JobNameLabel: "myjob", batch.LegacyControllerUidLabel: "test", batch.ControllerUidLabel: "test"},
 						},
-						Spec: api.PodSpec{
-							RestartPolicy: api.RestartPolicyOnFailure,
-							DNSPolicy:     api.DNSClusterFirst,
-							Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-						},
+						Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure)),
 					},
 				},
 			},
@@ -1269,7 +1147,6 @@ func TestJobStrategy_ValidateUpdate(t *testing.T) {
 			},
 		},
 		"old job is using FailIndex JobBackoffLimitPerIndex is disabled, but FailIndex was already used": {
-			enableJobPodFailurePolicy:     true,
 			enableJobBackoffLimitPerIndex: false,
 			job: &batch.Job{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1305,8 +1182,312 @@ func TestJobStrategy_ValidateUpdate(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobPodFailurePolicy, tc.enableJobPodFailurePolicy)
+			if !tc.enableJobBackoffLimitPerIndex {
+				// TODO: this will be removed in 1.36
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.32"))
+			}
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobBackoffLimitPerIndex, tc.enableJobBackoffLimitPerIndex)
+			newJob := tc.job.DeepCopy()
+			tc.update(newJob)
+			errs := Strategy.ValidateUpdate(ctx, newJob, tc.job)
+			if diff := cmp.Diff(tc.wantErrs, errs, ignoreErrValueDetail); diff != "" {
+				t.Errorf("Unexpected errors (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestJobStrategy_ValidateUpdate_MutablePodResources(t *testing.T) {
+	ctx := genericapirequest.NewDefaultContext()
+	now := metav1.Now()
+	validSelector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{"a": "b"},
+	}
+	validPodTemplateSpec := api.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: validSelector.MatchLabels,
+		},
+		Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure)),
+	}
+
+	cases := map[string]struct {
+		enableFeatureGate bool
+		job               *batch.Job
+		update            func(*batch.Job)
+		wantErrs          field.ErrorList
+	}{
+		"feature gate disabled - pod resource updates rejected": {
+			enableFeatureGate: false,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					Active: 0,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.Containers[0].Resources.Requests = api.ResourceList{
+					api.ResourceCPU: resource.MustParse("200m"),
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+		"feature gate enabled - job suspended, but with remaining active Pods  resource updates rejected": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					Active: 1,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionFalse),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.Containers[0].Resources.Requests = api.ResourceList{
+					api.ResourceCPU: resource.MustParse("200m"),
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+		"feature gate enabled - job suspended, with the suspended condition, but pods remain active - reject": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					Active: 1,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.Containers[0].Resources.Requests = api.ResourceList{
+					api.ResourceCPU: resource.MustParse("200m"),
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+		"feature gate enabled - unsuspended job resource updates rejected": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(false),
+				},
+				Status: batch.JobStatus{
+					Active: 1,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionFalse),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.Containers[0].Resources.Requests = api.ResourceList{
+					api.ResourceCPU: resource.MustParse("200m"),
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+		"feature gate enabled - suspended but started job resource updates allowed": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Active:    0,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.Containers[0].Resources.Requests = api.ResourceList{
+					api.ResourceCPU: resource.MustParse("200m"),
+				}
+			},
+		},
+		"feature gate enabled - suspended and not started job resource updates allowed": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					Active: 0,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.Containers[0].Resources.Requests = api.ResourceList{
+					api.ResourceCPU: resource.MustParse("200m"),
+				}
+			},
+		},
+		"feature gate enabled - non-resource field updates still rejected": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					Active: 0,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.Containers[0].Image = "different-image"
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template.spec"},
+			},
+		},
+		"feature gate enabled - job resuming (suspend=false) but JobSuspended condition still true - resource updates rejected": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(false),
+				},
+				Status: batch.JobStatus{
+					Active: 0,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.Containers[0].Resources.Requests = api.ResourceList{
+					api.ResourceCPU: resource.MustParse("200m"),
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.35"))
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MutablePodResourcesForSuspendedJobs, tc.enableFeatureGate)
+
 			newJob := tc.job.DeepCopy()
 			tc.update(newJob)
 			errs := Strategy.ValidateUpdate(ctx, newJob, tc.job)
@@ -1326,11 +1507,7 @@ func TestJobStrategy_WarningsOnUpdate(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: validSelector.MatchLabels,
 		},
-		Spec: api.PodSpec{
-			RestartPolicy: api.RestartPolicyOnFailure,
-			DNSPolicy:     api.DNSClusterFirst,
-			Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-		},
+		Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure)),
 	}
 	cases := map[string]struct {
 		oldJob            *batch.Job
@@ -1485,11 +1662,7 @@ func TestJobStrategy_WarningsOnCreate(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: validSelector.MatchLabels,
 		},
-		Spec: api.PodSpec{
-			RestartPolicy: api.RestartPolicyOnFailure,
-			DNSPolicy:     api.DNSClusterFirst,
-			Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-		},
+		Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure)),
 	}
 	validSpec := batch.JobSpec{
 		CompletionMode: completionModePtr(batch.NonIndexedCompletion),
@@ -1556,16 +1729,10 @@ func TestJobStrategy_Validate(t *testing.T) {
 	batchLabels := getValidBatchLabels()
 	labelsWithNonBatch := getValidBatchLabelsWithNonBatch()
 	defaultSelector := &metav1.LabelSelector{MatchLabels: map[string]string{batch.ControllerUidLabel: string(theUID)}}
-	validPodSpec := api.PodSpec{
-		RestartPolicy: api.RestartPolicyOnFailure,
-		DNSPolicy:     api.DNSClusterFirst,
-		Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-	}
-	validPodSpecNever := *validPodSpec.DeepCopy()
-	validPodSpecNever.RestartPolicy = api.RestartPolicyNever
+	validPodSpec := podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure))
+	validPodSpecNever := podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyNever))
 	validObjectMeta := getValidObjectMeta(0)
 	testcases := map[string]struct {
-		enableJobPodFailurePolicy     bool
 		enableJobBackoffLimitPerIndex bool
 		job                           *batch.Job
 		wantJob                       *batch.Job
@@ -1745,12 +1912,8 @@ func TestJobStrategy_Validate(t *testing.T) {
 						ObjectMeta: metav1.ObjectMeta{
 							Labels: labelsWithNonBatch,
 						},
-						Spec: api.PodSpec{
-							RestartPolicy: api.RestartPolicyOnFailure,
-							DNSPolicy:     api.DNSClusterFirst,
-							Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-							Volumes:       []api.Volume{{Name: "volume-name"}},
-						},
+						Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure),
+							podtest.SetVolumes(api.Volume{Name: "volume-name"})),
 					},
 				},
 			},
@@ -1763,19 +1926,14 @@ func TestJobStrategy_Validate(t *testing.T) {
 						ObjectMeta: metav1.ObjectMeta{
 							Labels: labelsWithNonBatch,
 						},
-						Spec: api.PodSpec{
-							RestartPolicy: api.RestartPolicyOnFailure,
-							DNSPolicy:     api.DNSClusterFirst,
-							Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-							Volumes:       []api.Volume{{Name: "volume-name"}},
-						},
+						Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure),
+							podtest.SetVolumes(api.Volume{Name: "volume-name"})),
 					},
 				},
 			},
 			wantWarningCount: 1,
 		},
 		"FailIndex action; when JobBackoffLimitPerIndex is disabled - validation error": {
-			enableJobPodFailurePolicy:     true,
 			enableJobBackoffLimitPerIndex: false,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
@@ -1828,7 +1986,6 @@ func TestJobStrategy_Validate(t *testing.T) {
 			wantWarningCount: 1,
 		},
 		"FailIndex action; when JobBackoffLimitPerIndex is enabled, but not used - validation error": {
-			enableJobPodFailurePolicy:     true,
 			enableJobBackoffLimitPerIndex: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
@@ -1881,7 +2038,6 @@ func TestJobStrategy_Validate(t *testing.T) {
 			wantWarningCount: 1,
 		},
 		"FailIndex action; when JobBackoffLimitPerIndex is enabled and used - no error": {
-			enableJobPodFailurePolicy:     true,
 			enableJobBackoffLimitPerIndex: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
@@ -1941,7 +2097,10 @@ func TestJobStrategy_Validate(t *testing.T) {
 	}
 	for name, tc := range testcases {
 		t.Run(name, func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobPodFailurePolicy, tc.enableJobPodFailurePolicy)
+			if !tc.enableJobBackoffLimitPerIndex {
+				// TODO: this will be removed in 1.36
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.32"))
+			}
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobBackoffLimitPerIndex, tc.enableJobBackoffLimitPerIndex)
 			errs := Strategy.Validate(ctx, tc.job)
 			if len(errs) != int(tc.wantWarningCount) {
@@ -2095,8 +2254,9 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 	nowPlusMinute := metav1.Time{Time: now.Add(time.Minute)}
 
 	cases := map[string]struct {
-		enableJobManagedBy     bool
-		enableJobSuccessPolicy bool
+		enableJobManagedBy            bool
+		enableJobSuccessPolicy        bool
+		enableJobPodReplacementPolicy bool
 
 		job      *batch.Job
 		newJob   *batch.Job
@@ -2188,6 +2348,51 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 			},
 			wantErrs: field.ErrorList{
 				{Type: field.ErrorTypeInvalid, Field: "status.conditions"},
+				{Type: field.ErrorTypeInvalid, Field: "status.conditions"},
+				{Type: field.ErrorTypeInvalid, Field: "status.conditions"},
+			},
+		},
+		"invalid addition of Complete=True without SuccessCriteriaMet=True": {
+			enableJobManagedBy: true,
+			job: &batch.Job{
+				ObjectMeta: validObjectMeta,
+			},
+			newJob: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime:      &now,
+					CompletionTime: &now,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobComplete,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "status.conditions"},
+			},
+		},
+		"invalid addition of Failed=True without FailureTarget=True": {
+			enableJobManagedBy: true,
+			job: &batch.Job{
+				ObjectMeta: validObjectMeta,
+			},
+			newJob: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobFailed,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "status.conditions"},
 			},
 		},
 		"completionTime can be removed to fix still running job": {
@@ -2210,11 +2415,23 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 			enableJobManagedBy: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobFailureTarget,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
 			},
 			newJob: &batch.Job{
 				ObjectMeta: validObjectMeta,
 				Status: batch.JobStatus{
 					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobFailureTarget,
+							Status: api.ConditionTrue,
+						},
 						{
 							Type:   batch.JobFailed,
 							Status: api.ConditionTrue,
@@ -2230,12 +2447,24 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 			enableJobManagedBy: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
 			},
 			newJob: &batch.Job{
 				ObjectMeta: validObjectMeta,
 				Status: batch.JobStatus{
 					CompletionTime: &now,
 					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
 						{
 							Type:   batch.JobComplete,
 							Status: api.ConditionTrue,
@@ -2251,6 +2480,16 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 			enableJobManagedBy: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Active:    1,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
 			},
 			newJob: &batch.Job{
 				ObjectMeta: validObjectMeta,
@@ -2259,6 +2498,10 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 					CompletionTime: &now,
 					Active:         1,
 					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
 						{
 							Type:   batch.JobComplete,
 							Status: api.ConditionTrue,
@@ -2270,10 +2513,20 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 				{Type: field.ErrorTypeInvalid, Field: "status.active"},
 			},
 		},
-		"transition to Failed condition with terminating>0 and ready>0": {
+		"invalid attempt to transition to Failed=True with terminating > 0": {
 			enableJobManagedBy: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobFailureTarget,
+							Status: api.ConditionTrue,
+						},
+					},
+					Terminating: ptr.To[int32](1),
+				},
 			},
 			newJob: &batch.Job{
 				ObjectMeta: validObjectMeta,
@@ -2281,19 +2534,73 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 					StartTime: &now,
 					Conditions: []batch.JobCondition{
 						{
+							Type:   batch.JobFailureTarget,
+							Status: api.ConditionTrue,
+						},
+						{
 							Type:   batch.JobFailed,
 							Status: api.ConditionTrue,
 						},
 					},
 					Terminating: ptr.To[int32](1),
-					Ready:       ptr.To[int32](1),
 				},
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "status.terminating"},
+			},
+		},
+		"invalid attempt to transition to Failed=True with active > 0": {
+			enableJobManagedBy: true,
+			job: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobFailureTarget,
+							Status: api.ConditionTrue,
+						},
+					},
+					Active: 1,
+				},
+			},
+			newJob: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobFailureTarget,
+							Status: api.ConditionTrue,
+						},
+						{
+							Type:   batch.JobFailed,
+							Status: api.ConditionTrue,
+						},
+					},
+					Active: 1,
+				},
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "status.active"},
 			},
 		},
 		"invalid attempt to transition to Failed=True with uncountedTerminatedPods.Failed>0": {
 			enableJobManagedBy: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &now,
+					UncountedTerminatedPods: &batch.UncountedTerminatedPods{
+						Failed: []types.UID{"a"},
+					},
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobFailureTarget,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
 			},
 			newJob: &batch.Job{
 				ObjectMeta: validObjectMeta,
@@ -2303,6 +2610,10 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 						Failed: []types.UID{"a"},
 					},
 					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobFailureTarget,
+							Status: api.ConditionTrue,
+						},
 						{
 							Type:   batch.JobFailed,
 							Status: api.ConditionTrue,
@@ -2395,6 +2706,18 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 			enableJobManagedBy: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &now,
+					UncountedTerminatedPods: &batch.UncountedTerminatedPods{
+						Succeeded: []types.UID{"a"},
+					},
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
 			},
 			newJob: &batch.Job{
 				ObjectMeta: validObjectMeta,
@@ -2405,6 +2728,10 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 						Succeeded: []types.UID{"a"},
 					},
 					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
 						{
 							Type:   batch.JobComplete,
 							Status: api.ConditionTrue,
@@ -2420,12 +2747,25 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 			enableJobManagedBy: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
 			},
 			newJob: &batch.Job{
 				ObjectMeta: validObjectMeta,
 				Status: batch.JobStatus{
 					StartTime: &now,
 					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
 						{
 							Type:   batch.JobComplete,
 							Status: api.ConditionTrue,
@@ -2525,12 +2865,45 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 				{Type: field.ErrorTypeRequired, Field: "status.startTime"},
 			},
 		},
+		"verify startTime can be updated when resuming job (JobSuspended: True -> False)": {
+			enableJobManagedBy: true,
+			job: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
+			},
+			newJob: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					StartTime: &nowPlusMinute,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionFalse,
+						},
+					},
+				},
+			},
+		},
 		"invalid attempt to set completionTime before startTime": {
 			enableJobManagedBy: true,
 			job: &batch.Job{
 				ObjectMeta: validObjectMeta,
 				Status: batch.JobStatus{
 					StartTime: &nowPlusMinute,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
+					},
 				},
 			},
 			newJob: &batch.Job{
@@ -2539,6 +2912,10 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 					StartTime:      &nowPlusMinute,
 					CompletionTime: &now,
 					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
 						{
 							Type:   batch.JobComplete,
 							Status: api.ConditionTrue,
@@ -2973,6 +3350,7 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 			},
 			wantErrs: field.ErrorList{
 				{Type: field.ErrorTypeInvalid, Field: "status.conditions"},
+				{Type: field.ErrorTypeInvalid, Field: "status.conditions"},
 			},
 		},
 		"invalid failedIndexes, which overlap with completedIndexes": {
@@ -3051,6 +3429,37 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 			},
 			wantErrs: field.ErrorList{
 				{Type: field.ErrorTypeInvalid, Field: "status.conditions"},
+			},
+		},
+		"valid update of Job if SuccessCriteriaMet already present for NonIndexed Jobs; JobSuccessPolicy enabled, while JobManagedBy and JobPodReplacementPolicy disabled": {
+			enableJobSuccessPolicy:        true,
+			enableJobManagedBy:            false,
+			enableJobPodReplacementPolicy: false,
+			job: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Spec:       batch.JobSpec{},
+				Status: batch.JobStatus{
+					Conditions: []batch.JobCondition{{
+						Type:   batch.JobSuccessCriteriaMet,
+						Status: api.ConditionTrue,
+					}},
+				},
+			},
+			newJob: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Spec:       batch.JobSpec{},
+				Status: batch.JobStatus{
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
+						{
+							Type:   batch.JobComplete,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
 			},
 		},
 		"invalid addition of SuccessCriteriaMet for Job with Failed": {
@@ -3410,11 +3819,103 @@ func TestStatusStrategy_ValidateUpdate(t *testing.T) {
 				{Type: field.ErrorTypeInvalid, Field: "status.conditions"},
 			},
 		},
+		"valid addition of SuccessCriteriaMet when JobManagedBy is enabled": {
+			enableJobManagedBy: true,
+			job: &batch.Job{
+				ObjectMeta: validObjectMeta,
+			},
+			newJob: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					Conditions: []batch.JobCondition{{
+						Type:   batch.JobSuccessCriteriaMet,
+						Status: api.ConditionTrue,
+					}},
+				},
+			},
+		},
+		"valid addition of SuccessCriteriaMet when JobPodReplacementPolicy is enabled": {
+			enableJobPodReplacementPolicy: true,
+			job: &batch.Job{
+				ObjectMeta: validObjectMeta,
+			},
+			newJob: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Status: batch.JobStatus{
+					Conditions: []batch.JobCondition{{
+						Type:   batch.JobSuccessCriteriaMet,
+						Status: api.ConditionTrue,
+					}},
+				},
+			},
+		},
+		"invalid attempt to set more ready pods than active": {
+			enableJobManagedBy: true,
+			job: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Spec: batch.JobSpec{
+					Completions: ptr.To[int32](5),
+				},
+			},
+			newJob: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Spec: batch.JobSpec{
+					Completions: ptr.To[int32](5),
+				},
+				Status: batch.JobStatus{
+					Active: 1,
+					Ready:  ptr.To[int32](2),
+				},
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "status.ready"},
+			},
+		},
+		"valid transition to Complete for suspended Job with completions=0; without startTime": {
+			enableJobManagedBy: true,
+			job: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Spec: batch.JobSpec{
+					Completions: ptr.To[int32](0),
+					Suspend:     ptr.To(true),
+				},
+			},
+			newJob: &batch.Job{
+				ObjectMeta: validObjectMeta,
+				Spec: batch.JobSpec{
+					Completions: ptr.To[int32](0),
+					Suspend:     ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					CompletionTime: &now,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuccessCriteriaMet,
+							Status: api.ConditionTrue,
+						},
+						{
+							Type:   batch.JobComplete,
+							Status: api.ConditionTrue,
+						},
+					},
+				},
+			},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobManagedBy, tc.enableJobManagedBy)
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobSuccessPolicy, tc.enableJobSuccessPolicy)
+			if !tc.enableJobSuccessPolicy {
+				// TODO: this will be removed in 1.36.
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.32"))
+			} else if !tc.enableJobPodReplacementPolicy {
+				// TODO: this will be removed in 1.37.
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.33"))
+			}
+			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+				features.JobManagedBy:            tc.enableJobManagedBy,
+				features.JobSuccessPolicy:        tc.enableJobSuccessPolicy,
+				features.JobPodReplacementPolicy: tc.enableJobPodReplacementPolicy,
+			})
 
 			errs := StatusStrategy.ValidateUpdate(ctx, tc.newJob, tc.job)
 			if diff := cmp.Diff(tc.wantErrs, errs, ignoreErrValueDetail); diff != "" {
@@ -3501,6 +4002,335 @@ func TestJobStrategy_GetAttrs(t *testing.T) {
 				if diff := cmp.Diff(labels.Set(tc.job.ObjectMeta.Labels), gotLabels); diff != "" {
 					t.Errorf("Unexpected attrs (-want,+got):\n%s", diff)
 				}
+			}
+		})
+	}
+}
+
+func TestJobStrategy_ValidateUpdate_MutableSchedulingDirectives(t *testing.T) {
+	ctx := genericapirequest.NewDefaultContext()
+	now := metav1.Now()
+	validSelector := &metav1.LabelSelector{
+		MatchLabels: map[string]string{"a": "b"},
+	}
+	validPodTemplateSpec := api.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: validSelector.MatchLabels,
+		},
+		Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(api.RestartPolicyOnFailure)),
+	}
+
+	cases := map[string]struct {
+		enableFeatureGate bool
+		job               *batch.Job
+		update            func(*batch.Job)
+		wantErrs          field.ErrorList
+	}{
+		"feature gate disabled - scheduling directives update allowed for suspended job never started": {
+			enableFeatureGate: false,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					Active:    0,
+					StartTime: nil,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.NodeSelector = map[string]string{
+					"key": "value",
+				}
+			},
+		},
+		"feature gate enabled - scheduling directives update allowed for suspended job never started": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					Active:    0,
+					StartTime: nil,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.NodeSelector = map[string]string{
+					"key": "value",
+				}
+			},
+		},
+		"feature gate disabled - scheduling directives update rejected for unsuspended Job": {
+			enableFeatureGate: false,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					Active:    1,
+					StartTime: &now,
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.NodeSelector = map[string]string{
+					"key": "value",
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+		"feature gate enabled - scheduling directives update rejected for unsuspended Job": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(false),
+				},
+				Status: batch.JobStatus{
+					Active:    1,
+					StartTime: &now,
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.NodeSelector = map[string]string{
+					"key": "value",
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+		"feature gate disabled - scheduling directives update rejected for suspended Job which was running in the past": {
+			enableFeatureGate: false,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Active:    0,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.NodeSelector = map[string]string{
+					"key": "value",
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+		"feature gate enabled - scheduling directives update allowed for suspended Job which was running in the past": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Active:    0,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.NodeSelector = map[string]string{
+					"key": "value",
+				}
+			},
+		},
+		"feature gate enabled - scheduling directives update rejected for suspended Job still have active pods": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Active:    1,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.NodeSelector = map[string]string{
+					"key": "value",
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+		"feature gate enabled - scheduling directives update rejected for suspended Job without Suspended condition": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(true),
+				},
+				Status: batch.JobStatus{
+					StartTime: &now,
+					Active:    1,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionFalse),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.NodeSelector = map[string]string{
+					"key": "value",
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+		"feature gate enabled - job resuming (suspend=false) but JobSuspended condition still true - scheduling directives update rejected": {
+			enableFeatureGate: true,
+			job: &batch.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "myjob",
+					Namespace:       metav1.NamespaceDefault,
+					ResourceVersion: "0",
+				},
+				Spec: batch.JobSpec{
+					Selector:       validSelector,
+					Template:       validPodTemplateSpec,
+					ManualSelector: ptr.To(true),
+					Parallelism:    ptr.To[int32](1),
+					Suspend:        ptr.To(false),
+				},
+				Status: batch.JobStatus{
+					Active: 0,
+					Conditions: []batch.JobCondition{
+						{
+							Type:   batch.JobSuspended,
+							Status: api.ConditionStatus(metav1.ConditionTrue),
+						},
+					},
+				},
+			},
+			update: func(job *batch.Job) {
+				job.Spec.Template.Spec.NodeSelector = map[string]string{
+					"key": "value",
+				}
+			},
+			wantErrs: field.ErrorList{
+				{Type: field.ErrorTypeInvalid, Field: "spec.template"},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.35"))
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MutableSchedulingDirectivesForSuspendedJobs, tc.enableFeatureGate)
+
+			newJob := tc.job.DeepCopy()
+			tc.update(newJob)
+			errs := Strategy.ValidateUpdate(ctx, newJob, tc.job)
+			if diff := cmp.Diff(tc.wantErrs, errs, ignoreErrValueDetail); diff != "" {
+				t.Errorf("Unexpected errors (-want,+got):\n%s", diff)
 			}
 		})
 	}

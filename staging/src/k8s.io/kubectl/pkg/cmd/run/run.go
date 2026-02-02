@@ -18,6 +18,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -26,7 +27,7 @@ import (
 	"k8s.io/klog/v2"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -166,22 +167,6 @@ func NewCmdRun(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Com
 	addRunFlags(cmd, o)
 	cmdutil.AddApplyAnnotationFlags(cmd)
 	cmdutil.AddPodRunningTimeoutFlag(cmd, defaultPodAttachTimeout)
-
-	// Deprecate the cascade flag. If set, it has no practical effect since the created pod has no dependents.
-	// TODO: Remove the cascade flag from the run command in kubectl 1.29
-	cmd.Flags().MarkDeprecated("cascade", "because it is not relevant for this command. It will be removed in version 1.29.")
-
-	// Deprecate and hide unused flags.
-	// These flags are being added to the run command by DeleteFlags to support pod deletion after attach,
-	// but they are not used if set, so they effectively do nothing.
-	// TODO: Remove these flags from the run command in kubectl 1.29
-	cmd.Flags().MarkDeprecated("filename", "because it is not used by this command. It will be removed in version 1.29.")
-	cmd.Flags().MarkDeprecated("force", "because it is not used by this command. It will be removed in version 1.29.")
-	cmd.Flags().MarkDeprecated("grace-period", "because it is not used by this command. It will be removed in version 1.29.")
-	cmd.Flags().MarkDeprecated("kustomize", "because it is not used by this command. It will be removed in version 1.29.")
-	cmd.Flags().MarkDeprecated("recursive", "because it is not used by this command. It will be removed in version 1.29.")
-	cmd.Flags().MarkDeprecated("timeout", "because it is not used by this command. It will be removed in version 1.29.")
-	cmd.Flags().MarkDeprecated("wait", "because it is not used by this command. It will be removed in version 1.29.")
 
 	return cmd
 }
@@ -490,7 +475,7 @@ func handleAttachPod(f cmdutil.Factory, podClient corev1client.PodsGetter, ns, n
 	}
 
 	if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-		return logOpts(f, pod, opts)
+		return logOpts(context.Background(), f, pod, opts, nil)
 	}
 
 	opts.Pod = pod
@@ -501,26 +486,50 @@ func handleAttachPod(f cmdutil.Factory, podClient corev1client.PodsGetter, ns, n
 		opts.AttachFunc = attach.DefaultAttachFunc
 	}
 
+	// Fetch and display any logs that were printed before attach connects.
+	ctrName, err := opts.GetContainerName(pod)
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if logErr := logOpts(ctx, f, pod, opts, &corev1.PodLogOptions{
+			Container: ctrName,
+			Follow:    false,
+		}); logErr != nil {
+			if opts.ErrOut != nil {
+				//nolint:errcheck
+				fmt.Fprintf(opts.ErrOut, "warning: couldn't fetch pre-attach logs: %v\n", logErr)
+			}
+		}
+		cancel()
+	}
+
 	if err := opts.Run(); err != nil {
 		fmt.Fprintf(opts.ErrOut, "warning: couldn't attach to pod/%s, falling back to streaming logs: %v\n", name, err)
-		return logOpts(f, pod, opts)
+		return logOpts(context.Background(), f, pod, opts, nil)
 	}
 	return nil
 }
 
 // logOpts logs output from opts to the pods log.
-func logOpts(restClientGetter genericclioptions.RESTClientGetter, pod *corev1.Pod, opts *attach.AttachOptions) error {
-	ctrName, err := opts.GetContainerName(pod)
-	if err != nil {
-		return err
+func logOpts(ctx context.Context, restClientGetter genericclioptions.RESTClientGetter, pod *corev1.Pod, opts *attach.AttachOptions, podOpts *corev1.PodLogOptions) error {
+	if podOpts == nil {
+		ctrName, err := opts.GetContainerName(pod)
+		if err != nil {
+			return err
+		}
+
+		podOpts = &corev1.PodLogOptions{}
+		podOpts.Container = ctrName
 	}
 
-	requests, err := polymorphichelpers.LogsForObjectFn(restClientGetter, pod, &corev1.PodLogOptions{Container: ctrName}, opts.GetPodTimeout, false)
+	requests, err := polymorphichelpers.LogsForObjectFn(restClientGetter, pod, podOpts, opts.GetPodTimeout, false)
 	if err != nil {
 		return err
 	}
 	for _, request := range requests {
-		if err := logs.DefaultConsumeRequest(request, opts.Out); err != nil {
+		if err := logs.DefaultConsumeRequest(ctx, request, opts.Out); err != nil {
+			if podOpts != nil && podOpts.Follow && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+				return nil
+			}
 			return err
 		}
 	}
@@ -679,7 +688,7 @@ var ErrPodCompleted = fmt.Errorf("pod ran to completion")
 func podCompleted(event watch.Event) (bool, error) {
 	switch event.Type {
 	case watch.Deleted:
-		return false, errors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
+		return false, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
 	}
 	switch t := event.Object.(type) {
 	case *corev1.Pod:
@@ -696,7 +705,7 @@ func podCompleted(event watch.Event) (bool, error) {
 func podSucceeded(event watch.Event) (bool, error) {
 	switch event.Type {
 	case watch.Deleted:
-		return false, errors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
+		return false, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
 	}
 	switch t := event.Object.(type) {
 	case *corev1.Pod:
@@ -711,7 +720,7 @@ func podSucceeded(event watch.Event) (bool, error) {
 func podRunningAndReady(event watch.Event) (bool, error) {
 	switch event.Type {
 	case watch.Deleted:
-		return false, errors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
+		return false, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "")
 	}
 	switch t := event.Object.(type) {
 	case *corev1.Pod:

@@ -272,6 +272,15 @@ func (in instrumentedRuntimeService) PortForward(ctx context.Context, req *runti
 	return resp, err
 }
 
+func (in instrumentedRuntimeService) UpdatePodSandboxResources(ctx context.Context, req *runtimeapi.UpdatePodSandboxResourcesRequest) (*runtimeapi.UpdatePodSandboxResourcesResponse, error) {
+	const operation = "update_podsandbox_resources"
+	defer recordOperation(operation, time.Now())
+
+	resp, err := in.service.UpdatePodSandboxResources(ctx, req)
+	recordError(operation, err)
+	return resp, err
+}
+
 func (in instrumentedRuntimeService) UpdateRuntimeConfig(ctx context.Context, runtimeConfig *runtimeapi.RuntimeConfig) error {
 	const operation = "update_runtime_config"
 	defer recordOperation(operation, time.Now())
@@ -326,6 +335,15 @@ func (in instrumentedImageManagerService) ImageFsInfo(ctx context.Context) (*run
 	return fsInfo, nil
 }
 
+func (in instrumentedImageManagerService) Close() error {
+	const operation = "close"
+	defer recordOperation(operation, time.Now())
+
+	err := in.service.Close()
+	recordError(operation, err)
+	return err
+}
+
 func (in instrumentedRuntimeService) CheckpointContainer(ctx context.Context, options *runtimeapi.CheckpointContainerRequest) error {
 	const operation = "checkpoint_container"
 	defer recordOperation(operation, time.Now())
@@ -335,11 +353,11 @@ func (in instrumentedRuntimeService) CheckpointContainer(ctx context.Context, op
 	return err
 }
 
-func (in instrumentedRuntimeService) GetContainerEvents(containerEventsCh chan *runtimeapi.ContainerEventResponse, connectionEstablishedCallback func(runtimeapi.RuntimeService_GetContainerEventsClient)) error {
+func (in instrumentedRuntimeService) GetContainerEvents(ctx context.Context, containerEventsCh chan *runtimeapi.ContainerEventResponse, connectionEstablishedCallback func(runtimeapi.RuntimeService_GetContainerEventsClient)) error {
 	const operation = "get_container_events"
 	defer recordOperation(operation, time.Now())
 
-	err := in.service.GetContainerEvents(containerEventsCh, connectionEstablishedCallback)
+	err := in.service.GetContainerEvents(ctx, containerEventsCh, connectionEstablishedCallback)
 	recordError(operation, err)
 	return err
 }
@@ -369,4 +387,13 @@ func (in instrumentedRuntimeService) RuntimeConfig(ctx context.Context) (*runtim
 	out, err := in.service.RuntimeConfig(ctx)
 	recordError(operation, err)
 	return out, err
+}
+
+func (in instrumentedRuntimeService) Close() error {
+	const operation = "close"
+	defer recordOperation(operation, time.Now())
+
+	err := in.service.Close()
+	recordError(operation, err)
+	return err
 }

@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright 2024 The Kubernetes Authors.
@@ -29,6 +28,9 @@ import (
 
 	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
+
+	"k8s.io/client-go/util/retry"
+	"k8s.io/kubernetes/pkg/proxy/util"
 )
 
 // MaxLength represents the maximum length allowed for the name in a nfacct counter.
@@ -59,13 +61,26 @@ type runner struct {
 	handler handler
 }
 
-// New returns a new Interface.
+// New returns a new Interface. If the netfilter_nfacct subsystem is
+// not available in the kernel it will return error.
 func New() (Interface, error) {
 	hndlr, err := newNetlinkHandler()
 	if err != nil {
 		return nil, err
 	}
-	return newInternal(hndlr)
+
+	rnr, err := newInternal(hndlr)
+	if err != nil {
+		return nil, err
+	}
+
+	// check if nfacct is supported on the current kernel by attempting to retrieve a counter.
+	// the following GET call should either succeed or return ENOENT.
+	_, err = rnr.Get("IMayExist")
+	if err != nil && !errors.Is(err, ErrObjectNotFound) {
+		return nil, ErrNotSupported
+	}
+	return rnr, nil
 }
 
 // newInternal returns a new Interface with the given handler.
@@ -133,9 +148,15 @@ func (r *runner) Get(name string) (*Counter, error) {
 
 // List is part of the interface.
 func (r *runner) List() ([]*Counter, error) {
-	req := r.handler.newRequest(cmdGet, unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
-	msgs, err := req.Execute(unix.NETLINK_NETFILTER, 0)
-	if err != nil {
+	var err error
+	var msgs [][]byte
+	err = retry.OnError(util.MaxAttemptsEINTR, util.ShouldRetryOnEINTR, func() error {
+		req := r.handler.newRequest(cmdGet, unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
+		msgs, err = req.Execute(unix.NETLINK_NETFILTER, 0)
+		return err
+	})
+
+	if err != nil && !errors.Is(err, unix.EINTR) {
 		return nil, handleError(err)
 	}
 
@@ -147,7 +168,7 @@ func (r *runner) List() ([]*Counter, error) {
 		}
 		counters = append(counters, counter)
 	}
-	return counters, nil
+	return counters, err
 }
 
 var ErrObjectNotFound = errors.New("object not found")
@@ -155,6 +176,7 @@ var ErrObjectAlreadyExists = errors.New("object already exists")
 var ErrNameExceedsMaxLength = fmt.Errorf("object name exceeds the maximum allowed length of %d characters", MaxLength)
 var ErrEmptyName = errors.New("object name cannot be empty")
 var ErrUnexpected = errors.New("unexpected error")
+var ErrNotSupported = errors.New("nfacct sub-system not available")
 
 func handleError(err error) error {
 	switch {

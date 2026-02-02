@@ -30,6 +30,10 @@ kube::codegen::gen_helpers \
     --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
     "${SCRIPT_ROOT}"
 
+kube::codegen::gen_register \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    "${SCRIPT_ROOT}"
+
 if [[ -n "${API_KNOWN_VIOLATIONS_DIR:-}" ]]; then
     report_filename="${API_KNOWN_VIOLATIONS_DIR}/codegen_violation_exceptions.list"
     if [[ "${UPDATE_API_KNOWN_VIOLATIONS:-}" == "true" ]]; then
@@ -41,6 +45,7 @@ kube::codegen::gen_openapi \
     --output-dir "${SCRIPT_ROOT}/apiserver/openapi" \
     --output-pkg "k8s.io/${THIS_PKG}/apiserver/openapi" \
     --report-filename "${report_filename:-"/dev/null"}" \
+    --output-model-name-file "zz_generated.model_name.go" \
     ${update_report:+"${update_report}"} \
     --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
     "${SCRIPT_ROOT}/apiserver/apis"
@@ -59,6 +64,15 @@ kube::codegen::gen_client \
     --output-pkg "${THIS_PKG}/crd" \
     --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
     "${SCRIPT_ROOT}/crd/apis"
+
+kube::codegen::gen_client \
+    --with-watch \
+    --with-applyconfig \
+    --output-dir "${SCRIPT_ROOT}/single" \
+    --output-pkg "${THIS_PKG}/single" \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    --one-input-api "api" \
+    "${SCRIPT_ROOT}/single"
 
 kube::codegen::gen_client \
     --with-watch \

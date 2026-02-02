@@ -22,6 +22,8 @@ import (
 	"reflect"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/runtime/serializer/cbor/internal/modes"
+
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/go-cmp/cmp"
 )
@@ -35,7 +37,7 @@ func (i int64BinaryMarshaler) MarshalBinary() ([]byte, error) {
 func TestEncode(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
-		modes         []cbor.EncMode
+		modes         []modes.EncMode
 		in            interface{}
 		want          []byte
 		assertOnError func(t *testing.T, e error)
@@ -92,6 +94,18 @@ func TestEncode(t *testing.T) {
 			name:          "[]byte marshalled to byte string in expected base64 encoding tag",
 			in:            []byte("hello"),
 			want:          []byte{0xd6, 0x45, 'h', 'e', 'l', 'l', 'o'},
+			assertOnError: assertNilError,
+		},
+		{
+			name:          "text marshaler",
+			in:            &RoundtrippableText{Text: "a"},
+			want:          []byte{0x61, 0x61},
+			assertOnError: assertNilError,
+		},
+		{
+			name:          "json marshaler",
+			in:            &RoundtrippableJSON{Raw: `"a"`},
+			want:          []byte{0x41, 0x61},
 			assertOnError: assertNilError,
 		},
 	} {

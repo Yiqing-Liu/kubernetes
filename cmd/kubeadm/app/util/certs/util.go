@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"net"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -38,7 +39,20 @@ func SetupCertificateAuthority(t *testing.T) (*x509.Certificate, crypto.Signer) 
 		Config: certutil.Config{CommonName: "kubernetes"},
 	})
 	if err != nil {
-		t.Fatalf("failure while generating CA certificate and key: %v", err)
+		t.Fatalf("Failure while generating CA certificate and key: %v", err)
+	}
+
+	return caCert, caKey
+}
+
+// SetupIntermediateCertificateAuthority is a utility function for kubeadm testing that creates a
+// Intermediate CertificateAuthority cert/key pair
+func SetupIntermediateCertificateAuthority(t *testing.T, parentCert *x509.Certificate, parentKey crypto.Signer, cn string) (*x509.Certificate, crypto.Signer) {
+	caCert, caKey, err := pkiutil.NewIntermediateCertificateAuthority(parentCert, parentKey, &pkiutil.CertConfig{
+		Config: certutil.Config{CommonName: cn},
+	})
+	if err != nil {
+		t.Fatalf("Failure while generating intermediate CA certificate and key: %v", err)
 	}
 
 	return caCert, caKey
@@ -102,10 +116,8 @@ func AssertCertificateHasOrganizations(t *testing.T, cert *x509.Certificate, org
 // AssertCertificateHasClientAuthUsage is a utility function for kubeadm testing that asserts if a given certificate has
 // the expected ExtKeyUsageClientAuth
 func AssertCertificateHasClientAuthUsage(t *testing.T, cert *x509.Certificate) {
-	for i := range cert.ExtKeyUsage {
-		if cert.ExtKeyUsage[i] == x509.ExtKeyUsageClientAuth {
-			return
-		}
+	if slices.Contains(cert.ExtKeyUsage, x509.ExtKeyUsageClientAuth) {
+		return
 	}
 	t.Error("cert has not ClientAuth usage as expected")
 }
@@ -113,10 +125,8 @@ func AssertCertificateHasClientAuthUsage(t *testing.T, cert *x509.Certificate) {
 // AssertCertificateHasServerAuthUsage is a utility function for kubeadm testing that asserts if a given certificate has
 // the expected ExtKeyUsageServerAuth
 func AssertCertificateHasServerAuthUsage(t *testing.T, cert *x509.Certificate) {
-	for i := range cert.ExtKeyUsage {
-		if cert.ExtKeyUsage[i] == x509.ExtKeyUsageServerAuth {
-			return
-		}
+	if slices.Contains(cert.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+		return
 	}
 	t.Error("cert is not a ServerAuth")
 }
@@ -125,13 +135,7 @@ func AssertCertificateHasServerAuthUsage(t *testing.T, cert *x509.Certificate) {
 // the expected DNSNames
 func AssertCertificateHasDNSNames(t *testing.T, cert *x509.Certificate, DNSNames ...string) {
 	for _, DNSName := range DNSNames {
-		found := false
-		for _, val := range cert.DNSNames {
-			if val == DNSName {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(cert.DNSNames, DNSName)
 
 		if !found {
 			t.Errorf("cert does not contain DNSName %s", DNSName)

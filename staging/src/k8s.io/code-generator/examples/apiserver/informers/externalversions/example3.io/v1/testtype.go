@@ -19,24 +19,24 @@ limitations under the License.
 package v1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
-	example3iov1 "k8s.io/code-generator/examples/apiserver/apis/example3.io/v1"
+	apisexample3iov1 "k8s.io/code-generator/examples/apiserver/apis/example3.io/v1"
 	versioned "k8s.io/code-generator/examples/apiserver/clientset/versioned"
 	internalinterfaces "k8s.io/code-generator/examples/apiserver/informers/externalversions/internalinterfaces"
-	v1 "k8s.io/code-generator/examples/apiserver/listers/example3.io/v1"
+	example3iov1 "k8s.io/code-generator/examples/apiserver/listers/example3.io/v1"
 )
 
 // TestTypeInformer provides access to a shared informer and lister for
 // TestTypes.
 type TestTypeInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.TestTypeLister
+	Lister() example3iov1.TestTypeLister
 }
 
 type testTypeInformer struct {
@@ -57,21 +57,33 @@ func NewTestTypeInformer(client versioned.Interface, namespace string, resyncPer
 // one. This reduces memory footprint and number of connections to the server.
 func NewFilteredTestTypeInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
 	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.ThirdExampleV1().TestTypes(namespace).List(context.TODO(), options)
+				return client.ThirdExampleV1().TestTypes(namespace).List(context.Background(), options)
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.ThirdExampleV1().TestTypes(namespace).Watch(context.TODO(), options)
+				return client.ThirdExampleV1().TestTypes(namespace).Watch(context.Background(), options)
 			},
-		},
-		&example3iov1.TestType{},
+			ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.ThirdExampleV1().TestTypes(namespace).List(ctx, options)
+			},
+			WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.ThirdExampleV1().TestTypes(namespace).Watch(ctx, options)
+			},
+		}, client),
+		&apisexample3iov1.TestType{},
 		resyncPeriod,
 		indexers,
 	)
@@ -82,9 +94,9 @@ func (f *testTypeInformer) defaultInformer(client versioned.Interface, resyncPer
 }
 
 func (f *testTypeInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&example3iov1.TestType{}, f.defaultInformer)
+	return f.factory.InformerFor(&apisexample3iov1.TestType{}, f.defaultInformer)
 }
 
-func (f *testTypeInformer) Lister() v1.TestTypeLister {
-	return v1.NewTestTypeLister(f.Informer().GetIndexer())
+func (f *testTypeInformer) Lister() example3iov1.TestTypeLister {
+	return example3iov1.NewTestTypeLister(f.Informer().GetIndexer())
 }

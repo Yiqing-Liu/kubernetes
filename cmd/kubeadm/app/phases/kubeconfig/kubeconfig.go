@@ -25,9 +25,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
-
-	"github.com/pkg/errors"
 
 	rbac "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -44,6 +43,7 @@ import (
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	certsphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
 )
@@ -148,7 +148,7 @@ func createKubeConfigFiles(outDir string, cfg *kubeadmapi.InitConfiguration, kub
 // NB. this method holds the information about how kubeadm creates kubeconfig files.
 func getKubeConfigSpecs(cfg *kubeadmapi.InitConfiguration) (map[string]*kubeConfigSpec, error) {
 	caCert, caKey, err := pkiutil.TryLoadCertAndKeyFromDisk(cfg.CertificatesDir, kubeadmconstants.CACertAndKeyBaseName)
-	if os.IsNotExist(errors.Cause(err)) {
+	if os.IsNotExist(errors.Unwrap(err)) {
 		return nil, errors.Wrap(err, "the CA files do not exist, please run `kubeadm init phase certs ca` to generate it")
 	}
 	if err != nil {
@@ -264,10 +264,28 @@ func validateKubeConfig(outDir, filename string, config *clientcmdapi.Config) er
 	}
 	caExpected := bytes.TrimSpace(config.Clusters[expectedCluster].CertificateAuthorityData)
 
-	// If the current CA cert on disk doesn't match the expected CA cert, error out because we have a file, but it's stale
-	if !bytes.Equal(caCurrent, caExpected) {
-		return errors.Errorf("a kubeconfig file %q exists already but has got the wrong CA cert", kubeConfigFilePath)
+	// Parse the current certificate authority data
+	currentCACerts, err := certutil.ParseCertsPEM(caCurrent)
+	if err != nil {
+		return errors.Errorf("the kubeconfig file %q contains an invalid CA cert", kubeConfigFilePath)
 	}
+
+	// Parse the expected certificate authority data
+	expectedCACerts, err := certutil.ParseCertsPEM(caExpected)
+	if err != nil {
+		return errors.Errorf("the expected base64 encoded CA cert could not be parsed as a PEM:\n%s\n", caExpected)
+	}
+
+	// Only use the first certificate in the current CA cert list
+	currentCaCert := currentCACerts[0]
+
+	// Find a common trust anchor
+	trustAnchorFound := slices.ContainsFunc(expectedCACerts, currentCaCert.Equal)
+	if !trustAnchorFound {
+		return errors.Errorf("a kubeconfig file %q exists but does not contain a trusted CA in its current context's "+
+			"cluster. Total CA certificates found: %d", kubeConfigFilePath, len(currentCACerts))
+	}
+
 	// If the current API Server location on disk doesn't match the expected API server, show a warning
 	if currentConfig.Clusters[currentCluster].Server != config.Clusters[expectedCluster].Server {
 		klog.Warningf("a kubeconfig file %q exists already but has an unexpected API Server URL: expected: %s, got: %s",
@@ -386,12 +404,18 @@ func writeKubeConfigFromSpec(out io.Writer, spec *kubeConfigSpec, clustername st
 func ValidateKubeconfigsForExternalCA(outDir string, cfg *kubeadmapi.InitConfiguration) error {
 	// Creates a kubeconfig file with the target CA and server URL
 	// to be used as a input for validating user provided kubeconfig files
-	caCert, err := pkiutil.TryLoadCertFromDisk(cfg.CertificatesDir, kubeadmconstants.CACertAndKeyBaseName)
+	caCert, intermediaries, err := pkiutil.TryLoadCertChainFromDisk(cfg.CertificatesDir, kubeadmconstants.CACertAndKeyBaseName)
 	if err != nil {
 		return errors.Wrapf(err, "the CA file couldn't be loaded")
 	}
+
+	// Combine caCert and intermediaries into one array
+	caCertChain := append([]*x509.Certificate{caCert}, intermediaries...)
+
 	// Validate period
-	certsphase.CheckCertificatePeriodValidity(kubeadmconstants.CACertAndKeyBaseName, caCert)
+	for _, cert := range caCertChain {
+		certsphase.CheckCertificatePeriodValidity(kubeadmconstants.CACertAndKeyBaseName, cert)
+	}
 
 	// validate user provided kubeconfig files for the scheduler and controller-manager
 	localAPIEndpoint, err := kubeadmutil.GetLocalAPIEndpoint(&cfg.LocalAPIEndpoint)
@@ -399,7 +423,12 @@ func ValidateKubeconfigsForExternalCA(outDir string, cfg *kubeadmapi.InitConfigu
 		return err
 	}
 
-	validationConfigLocal := kubeconfigutil.CreateBasic(localAPIEndpoint, "dummy", "dummy", pkiutil.EncodeCertPEM(caCert))
+	caCertBytes, err := pkiutil.EncodeCertBundlePEM(caCertChain)
+	if err != nil {
+		return err
+	}
+
+	validationConfigLocal := kubeconfigutil.CreateBasic(localAPIEndpoint, "dummy", "dummy", caCertBytes)
 	kubeConfigFileNamesLocal := []string{
 		kubeadmconstants.ControllerManagerKubeConfigFileName,
 		kubeadmconstants.SchedulerKubeConfigFileName,
@@ -417,7 +446,7 @@ func ValidateKubeconfigsForExternalCA(outDir string, cfg *kubeadmapi.InitConfigu
 		return err
 	}
 
-	validationConfigCPE := kubeconfigutil.CreateBasic(controlPlaneEndpoint, "dummy", "dummy", pkiutil.EncodeCertPEM(caCert))
+	validationConfigCPE := kubeconfigutil.CreateBasic(controlPlaneEndpoint, "dummy", "dummy", caCertBytes)
 	kubeConfigFileNamesCPE := []string{
 		kubeadmconstants.AdminKubeConfigFileName,
 		kubeadmconstants.SuperAdminKubeConfigFileName,

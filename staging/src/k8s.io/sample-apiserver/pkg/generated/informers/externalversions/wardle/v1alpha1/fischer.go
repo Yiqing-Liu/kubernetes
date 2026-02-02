@@ -19,24 +19,24 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
-	wardlev1alpha1 "k8s.io/sample-apiserver/pkg/apis/wardle/v1alpha1"
+	apiswardlev1alpha1 "k8s.io/sample-apiserver/pkg/apis/wardle/v1alpha1"
 	versioned "k8s.io/sample-apiserver/pkg/generated/clientset/versioned"
 	internalinterfaces "k8s.io/sample-apiserver/pkg/generated/informers/externalversions/internalinterfaces"
-	v1alpha1 "k8s.io/sample-apiserver/pkg/generated/listers/wardle/v1alpha1"
+	wardlev1alpha1 "k8s.io/sample-apiserver/pkg/generated/listers/wardle/v1alpha1"
 )
 
 // FischerInformer provides access to a shared informer and lister for
 // Fischers.
 type FischerInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1alpha1.FischerLister
+	Lister() wardlev1alpha1.FischerLister
 }
 
 type fischerInformer struct {
@@ -56,21 +56,33 @@ func NewFischerInformer(client versioned.Interface, resyncPeriod time.Duration, 
 // one. This reduces memory footprint and number of connections to the server.
 func NewFilteredFischerInformer(client versioned.Interface, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
 	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
 			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.WardleV1alpha1().Fischers().List(context.TODO(), options)
+				return client.WardleV1alpha1().Fischers().List(context.Background(), options)
 			},
 			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.WardleV1alpha1().Fischers().Watch(context.TODO(), options)
+				return client.WardleV1alpha1().Fischers().Watch(context.Background(), options)
 			},
-		},
-		&wardlev1alpha1.Fischer{},
+			ListWithContextFunc: func(ctx context.Context, options v1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.WardleV1alpha1().Fischers().List(ctx, options)
+			},
+			WatchFuncWithContext: func(ctx context.Context, options v1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.WardleV1alpha1().Fischers().Watch(ctx, options)
+			},
+		}, client),
+		&apiswardlev1alpha1.Fischer{},
 		resyncPeriod,
 		indexers,
 	)
@@ -81,9 +93,9 @@ func (f *fischerInformer) defaultInformer(client versioned.Interface, resyncPeri
 }
 
 func (f *fischerInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&wardlev1alpha1.Fischer{}, f.defaultInformer)
+	return f.factory.InformerFor(&apiswardlev1alpha1.Fischer{}, f.defaultInformer)
 }
 
-func (f *fischerInformer) Lister() v1alpha1.FischerLister {
-	return v1alpha1.NewFischerLister(f.Informer().GetIndexer())
+func (f *fischerInformer) Lister() wardlev1alpha1.FischerLister {
+	return wardlev1alpha1.NewFischerLister(f.Informer().GetIndexer())
 }

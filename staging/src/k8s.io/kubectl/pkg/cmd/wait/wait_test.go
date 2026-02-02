@@ -24,6 +24,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -76,7 +78,7 @@ spec:
           memory: 128Mi
         requests:
           cpu: 250m
-          memory: 64Mi  
+          memory: 64Mi
       terminationMessagePath: /dev/termination-log
       terminationMessagePolicy: File
       volumeMounts:
@@ -178,6 +180,20 @@ func newUnstructured(apiVersion, kind, namespace, name string) *unstructured.Uns
 	}
 }
 
+func newUnstructuredWithNewID(apiVersion, kind, namespace, name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": apiVersion,
+			"kind":       kind,
+			"metadata": map[string]interface{}{
+				"namespace": namespace,
+				"name":      name,
+				"uid":       "some-UID-value-new",
+			},
+		},
+	}
+}
+
 func newUnstructuredWithGeneration(apiVersion, kind, namespace, name string, generation int64) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -230,7 +246,7 @@ func createUnstructured(t *testing.T, config string) *unstructured.Unstructured 
 	t.Helper()
 	result := map[string]interface{}{}
 
-	require.False(t, strings.Contains(config, "\t"), "Yaml %s cannot contain tabs", config)
+	require.NotContains(t, config, "\t", "Yaml %s cannot contain tabs", config)
 	require.NoError(t, yaml.Unmarshal([]byte(config), &result), "Could not parse config:\n\n%s\n", config)
 
 	return &unstructured.Unstructured{
@@ -541,6 +557,32 @@ func TestWaitForDeletion(t *testing.T) {
 				return fakeClient
 			},
 			timeout: 10 * time.Second,
+		},
+		{
+			name: "when list watch, receives a new pod",
+			infos: []*resource.Info{
+				{
+					Mapping: &meta.RESTMapping{
+						Resource: schema.GroupVersionResource{Group: "group", Version: "version", Resource: "theresource"},
+					},
+					Name:      "name-foo",
+					Namespace: "ns-foo",
+				},
+			},
+			fakeClient: func() *dynamicfakeclient.FakeDynamicClient {
+				fakeClient := dynamicfakeclient.NewSimpleDynamicClientWithCustomListKinds(scheme, listMapping)
+				fakeClient.PrependReactor("get", "theresource", func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
+					return true, newUnstructured("group/version", "TheKind", "ns-foo", "name-foo"), nil
+				})
+				fakeClient.PrependReactor("list", "theresource", func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
+					return true, newUnstructuredList(newUnstructuredWithNewID("group/version", "TheKind", "ns-foo", "name-foo")), nil
+				})
+				return fakeClient
+			},
+			timeout: 10 * time.Second,
+			uidMap: UIDMap{
+				ResourceLocation{GroupResource: schema.GroupResource{Group: "group", Resource: "theresource"}, Namespace: "ns-foo", Name: "name-foo"}: types.UID("some-UID-value"),
+			},
 		},
 	}
 
@@ -966,6 +1008,77 @@ func TestWaitForCondition(t *testing.T) {
 				Printer:     printers.NewDiscardingPrinter(),
 				ConditionFn: ConditionalWait{conditionName: "the-condition", conditionStatus: "status-value", errOut: io.Discard}.IsConditionMet,
 				IOStreams:   genericiooptions.NewTestIOStreamsDiscard(),
+			}
+			err := o.RunWait()
+			switch {
+			case err == nil && len(test.expectedErr) == 0:
+			case err != nil && len(test.expectedErr) == 0:
+				t.Fatal(err)
+			case err == nil && len(test.expectedErr) != 0:
+				t.Fatalf("missing: %q", test.expectedErr)
+			case err != nil && len(test.expectedErr) != 0:
+				if !strings.Contains(err.Error(), test.expectedErr) {
+					t.Fatalf("expected %q, got %q", test.expectedErr, err.Error())
+				}
+			}
+		})
+	}
+}
+
+func TestWaitForCreate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	listMapping := map[schema.GroupVersionResource]string{
+		{Group: "group", Version: "version", Resource: "theresource"}: "TheKindList",
+	}
+
+	tests := []struct {
+		name       string
+		infos      []*resource.Info
+		infosErr   error
+		fakeClient func() *dynamicfakeclient.FakeDynamicClient
+		timeout    time.Duration
+
+		expectedErr string
+	}{
+		{
+			name:     "missing resource, should hit timeout",
+			infosErr: apierrors.NewNotFound(schema.GroupResource{Group: "group", Resource: "theresource"}, "name-foo"),
+			fakeClient: func() *dynamicfakeclient.FakeDynamicClient {
+				return dynamicfakeclient.NewSimpleDynamicClientWithCustomListKinds(scheme, listMapping)
+			},
+			timeout:     1 * time.Second,
+			expectedErr: "timed out waiting for the condition",
+		},
+		{
+			name: "wait should succeed",
+			infos: []*resource.Info{
+				{
+					Mapping: &meta.RESTMapping{
+						Resource: schema.GroupVersionResource{Group: "group", Version: "version", Resource: "theresource"},
+					},
+					Object:    &corev1.Pod{}, // the resource type is irrelevant here
+					Name:      "name-foo",
+					Namespace: "ns-foo",
+				},
+			},
+			fakeClient: func() *dynamicfakeclient.FakeDynamicClient {
+				return dynamicfakeclient.NewSimpleDynamicClientWithCustomListKinds(scheme, listMapping)
+			},
+			timeout: 1 * time.Second,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fakeClient := test.fakeClient()
+			o := &WaitOptions{
+				ResourceFinder: genericclioptions.NewSimpleFakeResourceFinder(test.infos...).WithError(test.infosErr),
+				DynamicClient:  fakeClient,
+				Timeout:        test.timeout,
+
+				Printer:      printers.NewDiscardingPrinter(),
+				ConditionFn:  IsCreated,
+				ForCondition: "create",
+				IOStreams:    genericiooptions.NewTestIOStreamsDiscard(),
 			}
 			err := o.RunWait()
 			switch {

@@ -43,32 +43,23 @@ func TestServiceCIDRStrategy(t *testing.T) {
 		t.Errorf("Expected ServiceCIDR to be cluster-scoped")
 	}
 
-	resetFields := Strategy.GetResetFields()
-	if len(resetFields) != 1 {
-		t.Errorf("ResetFields should have 1 element, but have %d", len(resetFields))
-	}
 	obj := &networking.ServiceCIDR{Spec: networking.ServiceCIDRSpec{CIDRs: []string{"bad cidr"}}}
 
 	errors := Strategy.Validate(context.TODO(), obj)
 	if len(errors) != 2 {
-		t.Errorf("Expected 2 validation errors for invalid object, got %d", len(errors))
+		t.Errorf("Expected 2 validation errors for invalid object, got %d : %v", len(errors), errors)
 	}
 
 	oldObj := newServiceCIDR()
 	newObj := oldObj.DeepCopy()
 	newObj.Spec.CIDRs = []string{"bad cidr"}
 	errors = Strategy.ValidateUpdate(context.TODO(), newObj, oldObj)
-	if len(errors) != 2 {
-		t.Errorf("Expected 2 validation errors for invalid update, got %d", len(errors))
+	if len(errors) != 1 {
+		t.Errorf("Expected 1 validation error for invalid update, got %d : %v", len(errors), errors)
 	}
 }
 
 func TestServiceCIDRStatusStrategy(t *testing.T) {
-	resetFields := StatusStrategy.GetResetFields()
-	if len(resetFields) != 1 {
-		t.Errorf("ResetFields should have 1 element, but have %d", len(resetFields))
-	}
-
 	oldObj := &networking.ServiceCIDR{Spec: networking.ServiceCIDRSpec{}}
 	newObj := &networking.ServiceCIDR{
 		Spec: networking.ServiceCIDRSpec{

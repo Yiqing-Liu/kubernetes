@@ -18,6 +18,7 @@ package ipallocator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -27,13 +28,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	networkingv1alpha1 "k8s.io/api/networking/v1alpha1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	networkingv1alpha1informers "k8s.io/client-go/informers/networking/v1alpha1"
-	networkingv1alpha1client "k8s.io/client-go/kubernetes/typed/networking/v1alpha1"
-	networkingv1alpha1listers "k8s.io/client-go/listers/networking/v1alpha1"
+	networkingv1informers "k8s.io/client-go/informers/networking/v1"
+	networkingv1client "k8s.io/client-go/kubernetes/typed/networking/v1"
+	networkingv1listers "k8s.io/client-go/listers/networking/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	api "k8s.io/kubernetes/pkg/apis/core"
@@ -56,8 +57,8 @@ type Allocator struct {
 	rangeOffset int    // subdivides the assigned IP range to prefer dynamic allocation from the upper range
 	size        uint64 // cap the total number of IPs available to maxInt64
 
-	client          networkingv1alpha1client.NetworkingV1alpha1Interface
-	ipAddressLister networkingv1alpha1listers.IPAddressLister
+	client          networkingv1client.NetworkingV1Interface
+	ipAddressLister networkingv1listers.IPAddressLister
 	ipAddressSynced cache.InformerSynced
 	// ready indicates if the allocator is able to allocate new IP addresses.
 	// This is required because it depends on the ServiceCIDR to be ready.
@@ -73,12 +74,12 @@ type Allocator struct {
 var _ Interface = &Allocator{}
 
 // NewIPAllocator returns an IP allocator associated to a network range
-// that use the IPAddress objectto track the assigned IP addresses,
+// that use the IPAddress object to track the assigned IP addresses,
 // using an informer cache as storage.
 func NewIPAllocator(
 	cidr *net.IPNet,
-	client networkingv1alpha1client.NetworkingV1alpha1Interface,
-	ipAddressInformer networkingv1alpha1informers.IPAddressInformer,
+	client networkingv1client.NetworkingV1Interface,
+	ipAddressInformer networkingv1informers.IPAddressInformer,
 ) (*Allocator, error) {
 	prefix, err := netip.ParsePrefix(cidr.String())
 	if err != nil {
@@ -139,15 +140,15 @@ func NewIPAllocator(
 }
 
 func (a *Allocator) createIPAddress(name string, svc *api.Service, scope string) error {
-	ipAddress := networkingv1alpha1.IPAddress{
+	ipAddress := networkingv1.IPAddress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 			Labels: map[string]string{
-				networkingv1alpha1.LabelIPAddressFamily: string(a.IPFamily()),
-				networkingv1alpha1.LabelManagedBy:       ControllerName,
+				networkingv1.LabelIPAddressFamily: string(a.IPFamily()),
+				networkingv1.LabelManagedBy:       ControllerName,
 			},
 		},
-		Spec: networkingv1alpha1.IPAddressSpec{
+		Spec: networkingv1.IPAddressSpec{
 			ParentRef: serviceToRef(svc),
 		},
 	}
@@ -206,7 +207,13 @@ func (a *Allocator) allocateService(svc *api.Service, ip net.IP, dryRun bool) er
 	if dryRun {
 		return nil
 	}
-	return a.createIPAddress(ip.String(), svc, "static")
+	start := time.Now()
+	err = a.createIPAddress(ip.String(), svc, "static")
+	if err != nil {
+		return err
+	}
+	a.metrics.setLatency(a.metricLabel, time.Since(start))
+	return nil
 }
 
 // AllocateNext return an IP address that wasn't allocated yet.
@@ -239,6 +246,7 @@ func (a *Allocator) allocateNextService(svc *api.Service, dryRun bool) (net.IP, 
 
 	trace := utiltrace.New("allocate dynamic ClusterIP address")
 	defer trace.LogIfLong(500 * time.Millisecond)
+	start := time.Now()
 
 	// rand.Int63n panics for n <= 0 so we need to avoid problems when
 	// converting from uint64 to int64
@@ -246,7 +254,11 @@ func (a *Allocator) allocateNextService(svc *api.Service, dryRun bool) (net.IP, 
 	var offset uint64
 	switch {
 	case rangeSize >= math.MaxInt64:
-		offset = rand.Uint64()
+		offset = a.rand.Uint64()
+		// a.offsetAddress + offset should not overflow a 64 bit CIDR.
+		if math.MaxUint64-offset < uint64(a.rangeOffset) {
+			offset -= uint64(a.rangeOffset)
+		}
 	case rangeSize == 0:
 		return net.IP{}, ErrFull
 	default:
@@ -255,20 +267,26 @@ func (a *Allocator) allocateNextService(svc *api.Service, dryRun bool) (net.IP, 
 	iterator := ipIterator(a.offsetAddress, a.lastAddress, offset)
 	ip, err := a.allocateFromRange(iterator, svc)
 	if err == nil {
+		a.metrics.setLatency(a.metricLabel, time.Since(start))
 		return ip, nil
 	}
-	// check the lower range
-	if a.rangeOffset != 0 {
+	// if the upper range is full, try to allocate from the lower range
+	if errors.Is(err, ErrFull) && a.rangeOffset != 0 {
 		offset = uint64(a.rand.Intn(a.rangeOffset))
 		iterator = ipIterator(a.firstAddress, a.offsetAddress.Prev(), offset)
 		ip, err = a.allocateFromRange(iterator, svc)
 		if err == nil {
+			a.metrics.setLatency(a.metricLabel, time.Since(start))
 			return ip, nil
 		}
 	}
-	// update metrics
+	// no IP available
+	if err == nil {
+		klog.Info("[SHOULD NOT HAPPEN] - No IP Allocated and no error")
+		err = ErrFull
+	}
 	a.metrics.incrementAllocationErrors(a.metricLabel, "dynamic")
-	return net.IP{}, ErrFull
+	return net.IP{}, err
 }
 
 // IP iterator allows to iterate over all the IP addresses
@@ -330,11 +348,17 @@ func (a *Allocator) allocateFromRange(iterator func() netip.Addr, svc *api.Servi
 		}
 		// address is not present on the cache, try to allocate it
 		err = a.createIPAddress(name, svc, "dynamic")
-		// an error can happen if there is a race and our informer was not updated
-		// swallow the error and try with the next IP address
+		// an error can happen if there is a TOCTOU race and the IP address
+		// was allocated by another instance, in that case, swallow the error
+		// and try with the next IP address, but abort on other errors.
+		// Ref: https://issues.k8s.io/135333
 		if err != nil {
+			if errors.Is(err, ErrAllocated) {
+				klog.Infof("mid-air collision trying to allocate IP %s that already exists, retrying ...", name)
+				continue
+			}
 			klog.Infof("can not create IPAddress %s: %v", name, err)
-			continue
+			return nil, err
 		}
 		return ip.AsSlice(), nil
 	}
@@ -370,8 +394,8 @@ func (a *Allocator) release(ip net.IP, dryRun bool) error {
 // This is required to satisfy the Allocator Interface only
 func (a *Allocator) ForEach(f func(net.IP)) {
 	ipLabelSelector := labels.Set(map[string]string{
-		networkingv1alpha1.LabelIPAddressFamily: string(a.IPFamily()),
-		networkingv1alpha1.LabelManagedBy:       ControllerName,
+		networkingv1.LabelIPAddressFamily: string(a.IPFamily()),
+		networkingv1.LabelManagedBy:       ControllerName,
 	}).AsSelectorPreValidated()
 	ips, err := a.ipAddressLister.List(ipLabelSelector)
 	if err != nil {
@@ -404,19 +428,51 @@ func (a *Allocator) IPFamily() api.IPFamily {
 // for testing, it assumes this is the allocator is unique for the ipFamily
 func (a *Allocator) Used() int {
 	ipLabelSelector := labels.Set(map[string]string{
-		networkingv1alpha1.LabelIPAddressFamily: string(a.IPFamily()),
-		networkingv1alpha1.LabelManagedBy:       ControllerName,
+		networkingv1.LabelIPAddressFamily: string(a.IPFamily()),
+		networkingv1.LabelManagedBy:       ControllerName,
 	}).AsSelectorPreValidated()
 	ips, err := a.ipAddressLister.List(ipLabelSelector)
 	if err != nil {
 		return 0
 	}
-	return len(ips)
+
+	// Count only IPs that belong to this allocator's CIDR
+	count := 0
+	for _, ipAddress := range ips {
+		// Parse the IP address string to netip.Addr type
+		ip, err := netip.ParseAddr(ipAddress.Name)
+		if err != nil {
+			continue
+		}
+		// Only count valid IPs that fall within this allocator's CIDR range
+		if a.prefix.Contains(ip) {
+			count++
+		}
+	}
+	return count
 }
 
 // for testing, it assumes this is the allocator is unique for the ipFamily
 func (a *Allocator) Free() int {
-	return int(a.size) - a.Used()
+	used := a.Used()
+
+	// Prevent integer overflow: if a.size exceeds int max value, use MaxInt
+	if a.size > math.MaxInt {
+		// In this case, used is definitely less than MaxInt, so no negative values
+		return math.MaxInt - used
+	}
+
+	size := int(a.size)
+
+	// Prevent negative return values due to data inconsistency
+	if used > size {
+		// This usually indicates data inconsistency, log a warning and return 0
+		klog.Warningf("IP allocator inconsistency detected: used (%d) > size (%d) for CIDR %s",
+			used, size, a.cidr.String())
+		return 0
+	}
+
+	return size - used
 }
 
 // Destroy
@@ -484,7 +540,7 @@ func (dry dryRunAllocator) EnableMetrics() {
 func addOffsetAddress(address netip.Addr, offset uint64) (netip.Addr, error) {
 	addressBytes := address.AsSlice()
 	addressBig := big.NewInt(0).SetBytes(addressBytes)
-	r := big.NewInt(0).Add(addressBig, big.NewInt(int64(offset))).Bytes()
+	r := big.NewInt(0).Add(addressBig, big.NewInt(0).SetUint64(offset)).Bytes()
 	// r must be 4 or 16 bytes depending of the ip family
 	// bigInt conversion to bytes will not take this into consideration
 	// and drop the leading zeros, so we have to take this into account.
@@ -559,12 +615,12 @@ func broadcastAddress(subnet netip.Prefix) (netip.Addr, error) {
 }
 
 // serviceToRef obtain the Service Parent Reference
-func serviceToRef(svc *api.Service) *networkingv1alpha1.ParentReference {
+func serviceToRef(svc *api.Service) *networkingv1.ParentReference {
 	if svc == nil {
 		return nil
 	}
 
-	return &networkingv1alpha1.ParentReference{
+	return &networkingv1.ParentReference{
 		Group:     "",
 		Resource:  "services",
 		Namespace: svc.Namespace,

@@ -24,8 +24,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/admission/initializer"
 	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
@@ -51,31 +53,21 @@ func TestEvictionForNoExecuteTaintAddedByUser(t *testing.T) {
 	nodeIndex := 1 // the exact node doesn't matter, pick one
 
 	tests := map[string]struct {
-		enablePodDisruptionConditions          bool
 		enableSeparateTaintEvictionController  bool
 		startStandaloneTaintEvictionController bool
 		wantPodEvicted                         bool
 	}{
-		"Test eviction for NoExecute taint added by user; pod condition added when PodDisruptionConditions enabled; separate taint eviction controller disabled": {
-			enablePodDisruptionConditions:          true,
-			enableSeparateTaintEvictionController:  false,
-			startStandaloneTaintEvictionController: false,
-			wantPodEvicted:                         true,
-		},
-		"Test eviction for NoExecute taint added by user; no pod condition added when PodDisruptionConditions disabled; separate taint eviction controller disabled": {
-			enablePodDisruptionConditions:          false,
+		"Test eviction for NoExecute taint added by user; pod condition added; separate taint eviction controller disabled": {
 			enableSeparateTaintEvictionController:  false,
 			startStandaloneTaintEvictionController: false,
 			wantPodEvicted:                         true,
 		},
 		"Test eviction for NoExecute taint added by user; separate taint eviction controller enabled but not started": {
-			enablePodDisruptionConditions:          false,
 			enableSeparateTaintEvictionController:  true,
 			startStandaloneTaintEvictionController: false,
 			wantPodEvicted:                         false,
 		},
 		"Test eviction for NoExecute taint added by user; separate taint eviction controller enabled and started": {
-			enablePodDisruptionConditions:          false,
 			enableSeparateTaintEvictionController:  true,
 			startStandaloneTaintEvictionController: true,
 			wantPodEvicted:                         true,
@@ -123,8 +115,8 @@ func TestEvictionForNoExecuteTaintAddedByUser(t *testing.T) {
 					},
 				},
 			}
-
-			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.PodDisruptionConditions, test.enablePodDisruptionConditions)
+			// TODO: this will be removed in 1.37
+			featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, feature.DefaultFeatureGate, version.MustParse("1.33"))
 			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.SeparateTaintEvictionController, test.enableSeparateTaintEvictionController)
 			testCtx := testutils.InitTestAPIServer(t, "taint-no-execute", nil)
 			cs := testCtx.ClientSet
@@ -202,9 +194,9 @@ func TestEvictionForNoExecuteTaintAddedByUser(t *testing.T) {
 				t.Fatalf("Test Failed: error: %q, while getting updated pod", err)
 			}
 			_, cond := podutil.GetPodCondition(&testPod.Status, v1.DisruptionTarget)
-			if test.enablePodDisruptionConditions && cond == nil {
+			if test.wantPodEvicted && cond == nil {
 				t.Errorf("Pod %q does not have the expected condition: %q", klog.KObj(testPod), v1.DisruptionTarget)
-			} else if !test.enablePodDisruptionConditions && cond != nil {
+			} else if !test.wantPodEvicted && cond != nil {
 				t.Errorf("Pod %q has an unexpected condition: %q", klog.KObj(testPod), v1.DisruptionTarget)
 			}
 		})
@@ -327,12 +319,17 @@ func TestTaintBasedEvictions(t *testing.T) {
 
 	// Build admission chain handler.
 	podTolerations := podtolerationrestriction.NewPodTolerationsPlugin(&pluginapi.Configuration{})
+	defaultTolerationSeconds, err := newHandlerForTest()
+	if err != nil {
+		t.Errorf("unexpected error initializing handler: %v", err)
+	}
 	admission := admission.NewChainHandler(
 		podTolerations,
-		defaulttolerationseconds.NewDefaultTolerationSeconds(),
+		defaultTolerationSeconds,
 	)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, feature.DefaultFeatureGate, version.MustParse("1.33"))
 			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.SeparateTaintEvictionController, test.enableSeparateTaintEvictionController)
 
 			testCtx := testutils.InitTestAPIServer(t, "taint-based-evictions", admission)
@@ -465,4 +462,12 @@ func TestTaintBasedEvictions(t *testing.T) {
 			testutils.CleanupNodes(cs, t)
 		})
 	}
+}
+
+// newHandlerForTest returns a handler configured for testing.
+func newHandlerForTest() (*defaulttolerationseconds.Plugin, error) {
+	handler := defaulttolerationseconds.NewDefaultTolerationSeconds()
+	pluginInitializer := initializer.New(nil, nil, nil, nil, nil, nil, nil, nil)
+	pluginInitializer.Initialize(handler)
+	return handler, admission.ValidateInitialization(handler)
 }
